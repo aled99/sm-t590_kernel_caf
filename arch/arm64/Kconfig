@@ -1192,3 +1192,6 @@ config RTC_AUTO_PWRON
           Say Y if you want to enable this feature.
 
 source "arch/arm64/Kconfig.sec"
+
+source "arch/arm64/hotplug/Kconfig"
+
