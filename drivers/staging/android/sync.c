@@ -781,9 +781,9 @@ static int sync_fill_pt_info(struct sync_pt *pt, void *data, int size)
 static long sync_fence_ioctl_fence_info(struct sync_fence *fence,
 					unsigned long arg)
 {
+	struct list_head *pos;
 	u8 data_buf[4096] __aligned(sizeof(long));
 	struct sync_fence_info_data *data = (typeof(data))data_buf;
-	struct list_head *pos;
 	__u32 size;
 	__u32 len = 0;
 	int ret;
@@ -796,10 +796,6 @@ static long sync_fence_ioctl_fence_info(struct sync_fence *fence,
 
 	if (size > 4096)
 		size = 4096;
-
-	data = kzalloc(size, GFP_KERNEL);
-	if (data == NULL)
-		return -ENOMEM;
 
 #ifdef CONFIG_SYNC_DEBUG
 	strlcpy(data->name, fence->name, sizeof(data->name));
