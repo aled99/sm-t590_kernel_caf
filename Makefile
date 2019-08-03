@@ -411,10 +411,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -fno-strict-aliasing -fno-common \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
-		   -std=gnu89
-
-# GCC flags to tune generated code for ROSY's Cortex-A53 CPU
-KBUILD_CFLAGS += -march=armv8-a+crc+crypto -mtune=cortex-a53 -mcpu=cortex-a53
+		   -march=armv8-a+crc+crypto -mtune=cortex-a53 -mcpu=cortex-a53 \
+		   -std=gnu89 $(call cc-option,-fno-PIE)
 
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
