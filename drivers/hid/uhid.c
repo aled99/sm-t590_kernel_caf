@@ -27,7 +27,6 @@
 #include <linux/wait.h>
 #include <linux/fb.h>
 #include <linux/uaccess.h>
->>>>>>> 8368d0d3fffd (Merge tag 'v3.18.127' of https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux into quartz)
 
 #define UHID_NAME	"uhid"
 #define UHID_BUFSIZE	32
