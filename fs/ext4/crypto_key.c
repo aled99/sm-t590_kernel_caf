@@ -147,7 +147,7 @@ int ext4_get_encryption_info(struct inode *inode)
 		return -EINVAL;
 	res = 0;
 
-	crypt_info = kmem_cache_alloc(ext4_crypt_info_cachep, GFP_NOFS);
+	crypt_info = kmem_cache_alloc(ext4_crypt_info_cachep, GFP_KERNEL);
 	if (!crypt_info)
 		return -ENOMEM;
 
@@ -169,12 +169,6 @@ int ext4_get_encryption_info(struct inode *inode)
 		break;
 	case EXT4_ENCRYPTION_MODE_AES_256_CTS:
 		cipher_str = "cts(cbc(aes))";
-		break;
-	case EXT4_ENCRYPTION_MODE_SPECK128_256_XTS:
-		cipher_str = "xts(speck128)";
-		break;
-	case EXT4_ENCRYPTION_MODE_SPECK128_256_CTS:
-		cipher_str = "cts(cbc(speck128))";
 		break;
 	default:
 		printk_once(KERN_WARNING
