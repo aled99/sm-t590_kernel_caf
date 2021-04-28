@@ -305,7 +305,7 @@ HOSTCC       = gcc
 HOSTCXX      = g++
 endif
 HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fomit-frame-pointer -std=gnu89
-HOSTCXXFLAGS = -O3
+HOSTCXXFLAGS = -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53
 
 ifeq ($(shell $(HOSTCC) -v 2>&1 | grep -c "clang version"), 1)
 HOSTCFLAGS  += -Wno-unused-value -Wno-unused-parameter \
@@ -639,7 +639,9 @@ KBUILD_AFLAGS	+= $(call cc-option,-fno-PIE)
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
 else
-KBUILD_CFLAGS	+= -O3 $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_CFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_AFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_LDFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
 endif
 
 BUILD_CFLAGS   += $(call cc-disable-warning,maybe-uninitialized,) \
