@@ -414,7 +414,7 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -std=gnu89
 
 # GCC flags to tune generated code for ROSY's Cortex-A53 CPU
-KBUILD_CFLAGS += -march=armv8-a -mtune=cortex-a53
+KBUILD_CFLAGS += -march=armv8-a+crc+crypto -mtune=cortex-a53 -mcpu=cortex-a53
 
 KBUILD_AFLAGS_KERNEL :=
 KBUILD_CFLAGS_KERNEL :=
@@ -634,9 +634,9 @@ KBUILD_AFLAGS	+= $(call cc-option,-fno-PIE)
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
 else
-KBUILD_CFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
-KBUILD_AFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
-KBUILD_LDFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_CFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_AFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_LDFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
 endif
 
 BUILD_CFLAGS   += $(call cc-disable-warning,maybe-uninitialized,) \
