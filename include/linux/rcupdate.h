@@ -653,7 +653,7 @@ static inline void rcu_preempt_sleep_check(void)
 #define __rcu_dereference_index_check(p, c) \
 ({ \
 	typeof(p) _________p1 = ACCESS_ONCE(p); \
-	RCU_LOCKDEP_WARN(c, \
+	rcu_lockdep_assert(c, \
 			   "suspicious rcu_dereference_index_check() usage"); \
 	smp_read_barrier_depends(); /* Dependency order vs. p above. */ \
 	(_________p1); \
