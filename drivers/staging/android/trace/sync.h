@@ -80,3 +80,4 @@ TRACE_EVENT(sync_pt,
 
 /* This part must be outside protection */
 #include <trace/define_trace.h>
+

@@ -1,77 +1,500 @@
-#undef TRACE_SYSTEM
-#define TRACE_INCLUDE_PATH ../../drivers/staging/android/trace
-#define TRACE_SYSTEM sync
+/*
+ * drivers/base/sync.c
+ *
+ * Copyright (C) 2012 Google, Inc.
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
 
-#if !defined(_TRACE_SYNC_H) || defined(TRACE_HEADER_MULTI_READ)
-#define _TRACE_SYNC_H
-
+#include <linux/debugfs.h>
+#include <linux/export.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/kernel.h>
+#include <linux/poll.h>
+#include <linux/sched.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/anon_inodes.h>
 #include <linux/sync.h>
-#include <linux/tracepoint.h>
 
-TRACE_EVENT(sync_timeline,
-	TP_PROTO(struct sync_timeline *timeline),
+#define CREATE_TRACE_POINTS
+#include "trace/sync.h"
 
-	TP_ARGS(timeline),
+static void sync_fence_signal_pt(struct sync_pt *pt);
+static int _sync_pt_has_signaled(struct sync_pt *pt);
+static void sync_fence_free(struct kref *kref);
+static void sync_dump(void);
 
-	TP_STRUCT__entry(
-			__string(name, timeline->name)
-			__array(char, value, 32)
-	),
+static LIST_HEAD(sync_timeline_list_head);
+static DEFINE_SPINLOCK(sync_timeline_list_lock);
 
-	TP_fast_assign(
-			__assign_str(name, timeline->name);
-			if (timeline->ops->timeline_value_str) {
-				timeline->ops->timeline_value_str(timeline,
-							__entry->value,
-							sizeof(__entry->value));
-			} else {
-				__entry->value[0] = '\0';
-			}
-	),
+static LIST_HEAD(sync_fence_list_head);
+static DEFINE_SPINLOCK(sync_fence_list_lock);
 
-	TP_printk("name=%s value=%s", __get_str(name), __entry->value)
-);
+struct sync_timeline *sync_timeline_create(const struct sync_timeline_ops *ops,
+					   int size, const char *name)
+{
+	struct sync_timeline *obj;
+	unsigned long flags;
 
-TRACE_EVENT(sync_wait,
-	TP_PROTO(struct sync_fence *fence, int begin),
+	if (size < sizeof(struct sync_timeline))
+		return NULL;
 
-	TP_ARGS(fence, begin),
+	obj = kzalloc(size, GFP_KERNEL);
+	if (obj == NULL)
+		return NULL;
 
-	TP_STRUCT__entry(
-			__string(name, fence->name)
-			__field(s32, status)
-			__field(u32, begin)
-	),
+	kref_init(&obj->kref);
+	obj->ops = ops;
+	strlcpy(obj->name, name, sizeof(obj->name));
 
-	TP_fast_assign(
-			__assign_str(name, fence->name);
-			__entry->status = fence->status;
-			__entry->begin = begin;
-	),
+	INIT_LIST_HEAD(&obj->child_list_head);
+	spin_lock_init(&obj->child_list_lock);
 
-	TP_printk("%s name=%s state=%d", __entry->begin ? "begin" : "end",
-			__get_str(name), __entry->status)
-);
+	INIT_LIST_HEAD(&obj->active_list_head);
+	spin_lock_init(&obj->active_list_lock);
 
-TRACE_EVENT(sync_pt,
-	TP_PROTO(struct sync_pt *pt),
+	spin_lock_irqsave(&sync_timeline_list_lock, flags);
+	list_add_tail(&obj->sync_timeline_list, &sync_timeline_list_head);
+	spin_unlock_irqrestore(&sync_timeline_list_lock, flags);
 
-	TP_ARGS(pt),
+	return obj;
+}
+EXPORT_SYMBOL(sync_timeline_create);
 
-	TP_STRUCT__entry(
-		__string(timeline, pt->parent->name)
-		__array(char, value, 32)
-	),
+static void sync_timeline_free(struct kref *kref)
+{
+	struct sync_timeline *obj =
+		container_of(kref, struct sync_timeline, kref);
+	unsigned long flags;
 
-	TP_fast_assign(
-		__assign_str(timeline, pt->parent->name);
-		if (pt->parent->ops->pt_value_str) {
-			pt->parent->ops->pt_value_str(pt, __entry->value,
-							sizeof(__entry->value));
-		} else {
-			__entry->value[0] = '\0';
+	spin_lock_irqsave(&sync_timeline_list_lock, flags);
+	list_del(&obj->sync_timeline_list);
+	spin_unlock_irqrestore(&sync_timeline_list_lock, flags);
+
+	if (obj->ops->release_obj)
+		obj->ops->release_obj(obj);
+
+	kfree(obj);
+}
+
+void sync_timeline_destroy(struct sync_timeline *obj)
+{
+	obj->destroyed = true;
+	/*
+	 * Ensure timeline is marked as destroyed before
+	 * changing timeline's fences status.
+	 */
+	smp_wmb();
+
+	/*
+	 * signal any children that their parent is going away.
+	 */
+	sync_timeline_signal(obj);
+
+	kref_put(&obj->kref, sync_timeline_free);
+}
+EXPORT_SYMBOL(sync_timeline_destroy);
+
+static void sync_timeline_add_pt(struct sync_timeline *obj, struct sync_pt *pt)
+{
+	unsigned long flags;
+
+	pt->parent = obj;
+
+	spin_lock_irqsave(&obj->child_list_lock, flags);
+	list_add_tail(&pt->child_list, &obj->child_list_head);
+	spin_unlock_irqrestore(&obj->child_list_lock, flags);
+}
+
+static void sync_timeline_remove_pt(struct sync_pt *pt)
+{
+	struct sync_timeline *obj = pt->parent;
+	unsigned long flags;
+
+	spin_lock_irqsave(&obj->active_list_lock, flags);
+	if (!list_empty(&pt->active_list))
+		list_del_init(&pt->active_list);
+	spin_unlock_irqrestore(&obj->active_list_lock, flags);
+
+	spin_lock_irqsave(&obj->child_list_lock, flags);
+	if (!list_empty(&pt->child_list))
+		list_del_init(&pt->child_list);
+
+	spin_unlock_irqrestore(&obj->child_list_lock, flags);
+}
+
+void sync_timeline_signal(struct sync_timeline *obj)
+{
+	unsigned long flags;
+	LIST_HEAD(signaled_pts);
+	struct list_head *pos, *n;
+
+	trace_sync_timeline(obj);
+
+	spin_lock_irqsave(&obj->active_list_lock, flags);
+
+	list_for_each_safe(pos, n, &obj->active_list_head) {
+		struct sync_pt *pt =
+			container_of(pos, struct sync_pt, active_list);
+
+		if (_sync_pt_has_signaled(pt)) {
+			list_del_init(pos);
+			list_add(&pt->signaled_list, &signaled_pts);
+			kref_get(&pt->fence->kref);
 		}
-	),
+	}
+
+	spin_unlock_irqrestore(&obj->active_list_lock, flags);
+
+	list_for_each_safe(pos, n, &signaled_pts) {
+		struct sync_pt *pt =
+			container_of(pos, struct sync_pt, signaled_list);
+
+		list_del_init(pos);
+		sync_fence_signal_pt(pt);
+		kref_put(&pt->fence->kref, sync_fence_free);
+	}
+}
+EXPORT_SYMBOL(sync_timeline_signal);
+
+struct sync_pt *sync_pt_create(struct sync_timeline *parent, int size)
+{
+	struct sync_pt *pt;
+
+	if (size < sizeof(struct sync_pt))
+		return NULL;
+
+	pt = kzalloc(size, GFP_KERNEL);
+	if (pt == NULL)
+		return NULL;
+
+	INIT_LIST_HEAD(&pt->active_list);
+	kref_get(&parent->kref);
+	sync_timeline_add_pt(parent, pt);
+
+	return pt;
+}
+EXPORT_SYMBOL(sync_pt_create);
+
+void sync_pt_free(struct sync_pt *pt)
+{
+	if (pt->parent->ops->free_pt)
+		pt->parent->ops->free_pt(pt);
+
+	sync_timeline_remove_pt(pt);
+
+	kref_put(&pt->parent->kref, sync_timeline_free);
+
+	kfree(pt);
+}
+EXPORT_SYMBOL(sync_pt_free);
+
+/* call with pt->parent->active_list_lock held */
+static int _sync_pt_has_signaled(struct sync_pt *pt)
+{
+	int old_status = pt->status;
+
+	if (!pt->status)
+		pt->status = pt->parent->ops->has_signaled(pt);
+
+	if (!pt->status && pt->parent->destroyed)
+		pt->status = -ENOENT;
+
+	if (pt->status != old_status)
+		pt->timestamp = ktime_get();
+
+	return pt->status;
+}
+
+static struct sync_pt *sync_pt_dup(struct sync_pt *pt)
+{
+	return pt->parent->ops->dup(pt);
+}
+
+/* Adds a sync pt to the active queue.  Called when added to a fence */
+static void sync_pt_activate(struct sync_pt *pt)
+{
+	struct sync_timeline *obj = pt->parent;
+	unsigned long flags;
+	int err;
+
+	spin_lock_irqsave(&obj->active_list_lock, flags);
+
+	err = _sync_pt_has_signaled(pt);
+	if (err != 0)
+		goto out;
+
+	list_add_tail(&pt->active_list, &obj->active_list_head);
+
+out:
+	spin_unlock_irqrestore(&obj->active_list_lock, flags);
+}
+
+static int sync_fence_release(struct inode *inode, struct file *file);
+static unsigned int sync_fence_poll(struct file *file, poll_table *wait);
+static long sync_fence_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg);
+
+
+static const struct file_operations sync_fence_fops = {
+	.release = sync_fence_release,
+	.poll = sync_fence_poll,
+	.unlocked_ioctl = sync_fence_ioctl,
+	.compat_ioctl = sync_fence_ioctl,
+};
+
+static struct sync_fence *sync_fence_alloc(const char *name)
+{
+	struct sync_fence *fence;
+	unsigned long flags;
+
+	fence = kzalloc(sizeof(struct sync_fence), GFP_KERNEL);
+	if (fence == NULL)
+		return NULL;
+
+	fence->file = anon_inode_getfile("sync_fence", &sync_fence_fops,
+					 fence, 0);
+	if (IS_ERR(fence->file))
+		goto err;
+
+	kref_init(&fence->kref);
+#ifdef CONFIG_SYNC_DEBUG
+	strlcpy(fence->name, name, sizeof(fence->name));
+#endif
+
+	INIT_LIST_HEAD(&fence->pt_list_head);
+	INIT_LIST_HEAD(&fence->waiter_list_head);
+	spin_lock_init(&fence->waiter_list_lock);
+
+	init_waitqueue_head(&fence->wq);
+
+	spin_lock_irqsave(&sync_fence_list_lock, flags);
+	list_add_tail(&fence->sync_fence_list, &sync_fence_list_head);
+	spin_unlock_irqrestore(&sync_fence_list_lock, flags);
+
+	return fence;
+
+err:
+	kfree(fence);
+	return NULL;
+}
+
+/* TODO: implement a create which takes more that one sync_pt */
+struct sync_fence *sync_fence_create(const char *name, struct sync_pt *pt)
+{
+	struct sync_fence *fence;
+
+	if (pt->fence)
+		return NULL;
+
+	fence = sync_fence_alloc(name);
+	if (fence == NULL)
+		return NULL;
+
+	pt->fence = fence;
+	list_add(&pt->pt_list, &fence->pt_list_head);
+	sync_pt_activate(pt);
+
+	/*
+	 * signal the fence in case pt was activated before
+	 * sync_pt_activate(pt) was called
+	 */
+	sync_fence_signal_pt(pt);
+
+	return fence;
+}
+EXPORT_SYMBOL(sync_fence_create);
+
+static int sync_fence_copy_pts(struct sync_fence *dst, struct sync_fence *src)
+{
+	struct list_head *pos;
+
+	list_for_each(pos, &src->pt_list_head) {
+		struct sync_pt *orig_pt =
+			container_of(pos, struct sync_pt, pt_list);
+		struct sync_pt *new_pt = sync_pt_dup(orig_pt);
+
+		if (new_pt == NULL)
+			return -ENOMEM;
+
+		new_pt->fence = dst;
+		list_add(&new_pt->pt_list, &dst->pt_list_head);
+	}
+
+	return 0;
+}
+
+static int sync_fence_merge_pts(struct sync_fence *dst, struct sync_fence *src)
+{
+	struct list_head *src_pos, *dst_pos, *n;
+
+	list_for_each(src_pos, &src->pt_list_head) {
+		struct sync_pt *src_pt =
+			container_of(src_pos, struct sync_pt, pt_list);
+		bool collapsed = false;
+
+		list_for_each_safe(dst_pos, n, &dst->pt_list_head) {
+			struct sync_pt *dst_pt =
+				container_of(dst_pos, struct sync_pt, pt_list);
+			/* collapse two sync_pts on the same timeline
+			 * to a single sync_pt that will signal at
+			 * the later of the two
+			 */
+			if (dst_pt->parent == src_pt->parent) {
+				if (dst_pt->parent->ops->compare(dst_pt, src_pt)
+						 == -1) {
+					struct sync_pt *new_pt =
+						sync_pt_dup(src_pt);
+					if (new_pt == NULL)
+						return -ENOMEM;
+
+					new_pt->fence = dst;
+					list_replace(&dst_pt->pt_list,
+						     &new_pt->pt_list);
+					sync_pt_free(dst_pt);
+				}
+				collapsed = true;
+				break;
+			}
+		}
+
+		if (!collapsed) {
+			struct sync_pt *new_pt = sync_pt_dup(src_pt);
+
+			if (new_pt == NULL)
+				return -ENOMEM;
+
+			new_pt->fence = dst;
+			list_add(&new_pt->pt_list, &dst->pt_list_head);
+		}
+	}
+
+	return 0;
+}
+
+static void sync_fence_detach_pts(struct sync_fence *fence)
+{
+	struct list_head *pos, *n;
+
+	list_for_each_safe(pos, n, &fence->pt_list_head) {
+		struct sync_pt *pt = container_of(pos, struct sync_pt, pt_list);
+
+		sync_timeline_remove_pt(pt);
+	}
+}
+
+static void sync_fence_free_pts(struct sync_fence *fence)
+{
+	struct list_head *pos, *n;
+
+	list_for_each_safe(pos, n, &fence->pt_list_head) {
+		struct sync_pt *pt = container_of(pos, struct sync_pt, pt_list);
+
+		sync_pt_free(pt);
+	}
+}
+
+struct sync_fence *sync_fence_fdget(int fd)
+{
+	struct file *file = fget(fd);
+
+	if (file == NULL)
+		return NULL;
+
+	if (file->f_op != &sync_fence_fops)
+		goto err;
+
+	return file->private_data;
+
+err:
+	fput(file);
+	return NULL;
+}
+EXPORT_SYMBOL(sync_fence_fdget);
+
+void sync_fence_put(struct sync_fence *fence)
+{
+	fput(fence->file);
+}
+EXPORT_SYMBOL(sync_fence_put);
+
+void sync_fence_install(struct sync_fence *fence, int fd)
+{
+	fd_install(fd, fence->file);
+}
+EXPORT_SYMBOL(sync_fence_install);
+
+static int sync_fence_get_status(struct sync_fence *fence)
+{
+	struct list_head *pos;
+	int status = 1;
+
+	list_for_each(pos, &fence->pt_list_head) {
+		struct sync_pt *pt = container_of(pos, struct sync_pt, pt_list);
+		int pt_status = pt->status;
+
+		if (pt_status < 0) {
+			status = pt_status;
+			break;
+		} else if (status == 1) {
+			status = pt_status;
+		}
+	}
+
+	return status;
+}
+
+struct sync_fence *sync_fence_merge(const char *name,
+				    struct sync_fence *a, struct sync_fence *b)
+{
+	struct sync_fence *fence;
+	struct list_head *pos;
+	int err;
+
+	fence = sync_fence_alloc(name);
+	if (fence == NULL)
+		return NULL;
+
+	err = sync_fence_copy_pts(fence, a);
+	if (err < 0)
+		goto err;
+
+	err = sync_fence_merge_pts(fence, b);
+	if (err < 0)
+		goto err;
+
+	list_for_each(pos, &fence->pt_list_head) {
+		struct sync_pt *pt =
+			container_of(pos, struct sync_pt, pt_list);
+		sync_pt_activate(pt);
+	}
+
+	/*
+	 * signal the fence in case one of it's pts were activated before
+	 * they were activated
+	 */
+	sync_fence_signal_pt(list_first_entry(&fence->pt_list_head,
+					      struct sync_pt,
+					      pt_list));
+
+	return fence;
+err:
+	sync_fence_free_pts(fence);
+	kfree(fence);
+	return NULL;
+}
+EXPORT_SYMBOL(sync_fence_merge);
 
 static void sync_fence_signal_pt(struct sync_pt *pt)
 {
@@ -359,9 +782,9 @@ static int sync_fill_pt_info(struct sync_pt *pt, void *data, int size)
 static long sync_fence_ioctl_fence_info(struct sync_fence *fence,
 					unsigned long arg)
 {
-	struct list_head *pos;
 	u8 data_buf[4096] __aligned(sizeof(long));
 	struct sync_fence_info_data *data = (typeof(data))data_buf;
+	struct list_head *pos;
 	__u32 size;
 	__u32 len = 0;
 	int ret;
@@ -375,10 +798,8 @@ static long sync_fence_ioctl_fence_info(struct sync_fence *fence,
 	if (size > 4096)
 		size = 4096;
 
-#ifdef CONFIG_SYNC_DEBUG
 	strlcpy(data->name, fence->name, sizeof(data->name));
 	data->status = fence->status;
-#endif
 	len = sizeof(struct sync_fence_info_data);
 
 	list_for_each(pos, &fence->pt_list_head) {
@@ -521,11 +942,85 @@ static void sync_print_fence(struct seq_file *s, struct sync_fence *fence)
 	spin_unlock_irqrestore(&fence->waiter_list_lock, flags);
 }
 
-	TP_printk("name=%s value=%s", __get_str(timeline), __entry->value)
-);
+static int sync_debugfs_show(struct seq_file *s, void *unused)
+{
+	unsigned long flags;
+	struct list_head *pos;
 
-#endif /* if !defined(_TRACE_SYNC_H) || defined(TRACE_HEADER_MULTI_READ) */
+	seq_puts(s, "objs:\n--------------\n");
 
-/* This part must be outside protection */
-#include <trace/define_trace.h>
+	spin_lock_irqsave(&sync_timeline_list_lock, flags);
+	list_for_each(pos, &sync_timeline_list_head) {
+		struct sync_timeline *obj =
+			container_of(pos, struct sync_timeline,
+				     sync_timeline_list);
+
+		sync_print_obj(s, obj);
+		seq_puts(s, "\n");
+	}
+	spin_unlock_irqrestore(&sync_timeline_list_lock, flags);
+
+	seq_puts(s, "fences:\n--------------\n");
+
+	spin_lock_irqsave(&sync_fence_list_lock, flags);
+	list_for_each(pos, &sync_fence_list_head) {
+		struct sync_fence *fence =
+			container_of(pos, struct sync_fence, sync_fence_list);
+
+		sync_print_fence(s, fence);
+		seq_puts(s, "\n");
+	}
+	spin_unlock_irqrestore(&sync_fence_list_lock, flags);
+	return 0;
+}
+
+static int sync_debugfs_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, sync_debugfs_show, inode->i_private);
+}
+
+static const struct file_operations sync_debugfs_fops = {
+	.open           = sync_debugfs_open,
+	.read           = seq_read,
+	.llseek         = seq_lseek,
+	.release        = single_release,
+};
+
+static __init int sync_debugfs_init(void)
+{
+	debugfs_create_file("sync", S_IRUGO, NULL, NULL, &sync_debugfs_fops);
+	return 0;
+}
+late_initcall(sync_debugfs_init);
+
+#define DUMP_CHUNK 256
+static char sync_dump_buf[64 * 1024];
+static void sync_dump(void)
+{
+	struct seq_file s = {
+		.buf = sync_dump_buf,
+		.size = sizeof(sync_dump_buf) - 1,
+	};
+	int i;
+
+	sync_debugfs_show(&s, NULL);
+
+	for (i = 0; i < s.count; i += DUMP_CHUNK) {
+		if ((s.count - i) > DUMP_CHUNK) {
+			char c = s.buf[i + DUMP_CHUNK];
+
+			s.buf[i + DUMP_CHUNK] = 0;
+			pr_cont("%s", s.buf + i);
+			s.buf[i + DUMP_CHUNK] = c;
+		} else {
+			s.buf[s.count] = 0;
+			pr_cont("%s", s.buf + i);
+		}
+	}
+}
+#else
+static void sync_dump(void)
+{
+}
+#endif
 
