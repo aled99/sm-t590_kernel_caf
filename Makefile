@@ -305,7 +305,7 @@ HOSTCC       = gcc
 HOSTCXX      = g++
 endif
 HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O3 -fomit-frame-pointer -std=gnu89
-HOSTCXXFLAGS = -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53
+HOSTCXXFLAGS = -O3 -mcpu=cortex-a53 -mtune=cortex-a53
 
 # Decide whether to build built-in, modular, or both.
 # Normally, just do built-in.
@@ -658,9 +658,9 @@ KBUILD_AFLAGS	+= $(call cc-option,-fno-PIE)
 ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS	+= -Os $(call cc-disable-warning,maybe-uninitialized,)
 else
-KBUILD_CFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
-KBUILD_AFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
-KBUILD_LDFLAGS	+= -O3 -floop-nest-optimize -fgraphite-identity -ftree-loop-distribution -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_CFLAGS	+= -O3 -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_AFLAGS	+= -O3 -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
+KBUILD_LDFLAGS	+= -O3 -mcpu=cortex-a53 -mtune=cortex-a53 -march=armv8-a+crc+crypto $(call cc-disable-warning,maybe-uninitialized,)
 endif
 
 BUILD_CFLAGS   += $(call cc-disable-warning,maybe-uninitialized,) \
